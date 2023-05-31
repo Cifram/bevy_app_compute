@@ -1,11 +1,11 @@
 use std::{borrow::Cow, marker::PhantomData};
 
 use bevy::{
-    prelude::{AssetServer, World},
+    prelude::{AssetServer, World, Handle, Image},
     render::{
         render_resource::{
             encase::{private::WriteInto, StorageBuffer, UniformBuffer},
-            Buffer, ComputePipelineDescriptor, ShaderRef, ShaderType,
+            ComputePipelineDescriptor, ShaderRef, ShaderType,
         },
         renderer::RenderDevice,
     },
@@ -16,7 +16,7 @@ use wgpu::{util::BufferInitDescriptor, BufferDescriptor, BufferUsages};
 use crate::{
     pipeline_cache::{AppPipelineCache, CachedAppComputePipelineId},
     traits::{ComputeShader, ComputeWorker},
-    worker::{AppComputeWorker, ComputePass, RunMode, StagingBuffer, Step},
+    worker::{AppComputeWorker, ComputePass, RunMode, StagingBuffer, Step, BufferType},
 };
 
 /// A builder struct to build [`AppComputeWorker<W>`]
@@ -24,7 +24,7 @@ use crate::{
 pub struct AppComputeWorkerBuilder<'a, W: ComputeWorker> {
     pub(crate) world: &'a mut World,
     pub(crate) cached_pipeline_ids: HashMap<Uuid, CachedAppComputePipelineId>,
-    pub(crate) buffers: HashMap<String, Buffer>,
+    pub(crate) buffers: HashMap<String, BufferType>,
     pub(crate) staging_buffers: HashMap<String, StagingBuffer>,
     pub(crate) steps: Vec<Step>,
     pub(crate) run_mode: RunMode,
@@ -57,11 +57,11 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
 
         self.buffers.insert(
             name.to_owned(),
-            render_device.create_buffer_with_data(&BufferInitDescriptor {
+            BufferType::Buffer(render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some(name),
                 contents: buffer.as_ref(),
                 usage: BufferUsages::COPY_DST | BufferUsages::UNIFORM,
-            }),
+            })),
         );
         self
     }
@@ -75,11 +75,11 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
 
         self.buffers.insert(
             name.to_owned(),
-            render_device.create_buffer_with_data(&BufferInitDescriptor {
+            BufferType::Buffer(render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some(name),
                 contents: buffer.as_ref(),
                 usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
-            }),
+            })),
         );
         self
     }
@@ -97,11 +97,11 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
 
         self.buffers.insert(
             name.to_owned(),
-            render_device.create_buffer_with_data(&BufferInitDescriptor {
+            BufferType::Buffer(render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some(name),
                 contents: buffer.as_ref(),
                 usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
-            }),
+            })),
         );
         self
     }
@@ -112,7 +112,9 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
     /// The buffer will be filled with `data`
     pub fn add_staging<T: ShaderType + WriteInto>(&mut self, name: &str, data: &T) -> &mut Self {
         self.add_rw_storage(name, data);
-        let buffer = self.buffers.get(name).unwrap();
+        let BufferType::Buffer(buffer) = self.buffers.get(name).unwrap() else {
+            panic!("Buffer not found");
+        };
 
         let render_device = self.world.resource::<RenderDevice>();
 
@@ -131,18 +133,23 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
         self
     }
 
+    pub fn add_texture(&mut self, name: &str, texture: Handle<Image>) -> &mut Self {
+        self.buffers.insert(name.to_owned(), BufferType::Texture(texture));
+        self
+    }
+
     /// Add a new empty uniform buffer to the worker.
     pub fn add_empty_uniform(&mut self, name: &str, size: u64) -> &mut Self {
         let render_device = self.world.resource::<RenderDevice>();
 
         self.buffers.insert(
             name.to_owned(),
-            render_device.create_buffer(&BufferDescriptor {
+            BufferType::Buffer(render_device.create_buffer(&BufferDescriptor {
                 label: Some(name),
                 size,
                 usage: BufferUsages::COPY_DST | BufferUsages::UNIFORM,
                 mapped_at_creation: false,
-            }),
+            })),
         );
 
         self
@@ -154,12 +161,12 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
 
         self.buffers.insert(
             name.to_owned(),
-            render_device.create_buffer(&BufferDescriptor {
+            BufferType::Buffer(render_device.create_buffer(&BufferDescriptor {
                 label: Some(name),
                 size,
                 usage: BufferUsages::COPY_DST | BufferUsages::STORAGE,
                 mapped_at_creation: false,
-            }),
+            })),
         );
         self
     }
@@ -170,12 +177,12 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
 
         self.buffers.insert(
             name.to_owned(),
-            render_device.create_buffer(&BufferDescriptor {
+            BufferType::Buffer(render_device.create_buffer(&BufferDescriptor {
                 label: Some(name),
                 size,
                 usage: BufferUsages::COPY_DST | BufferUsages::COPY_SRC | BufferUsages::STORAGE,
                 mapped_at_creation: false,
-            }),
+            })),
         );
         self
     }
@@ -187,7 +194,9 @@ impl<'a, W: ComputeWorker> AppComputeWorkerBuilder<'a, W> {
     pub fn add_empty_staging(&mut self, name: &str, size: u64) -> &mut Self {
         self.add_empty_rw_storage(name, size);
 
-        let buffer = self.buffers.get(name).unwrap();
+        let BufferType::Buffer(buffer) = self.buffers.get(name).unwrap() else {
+            panic!("Buffer not found");
+        };
 
         let render_device = self.world.resource::<RenderDevice>();
 

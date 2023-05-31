@@ -2,17 +2,17 @@ use core::panic;
 use std::{marker::PhantomData, ops::Deref};
 
 use bevy::{
-    prelude::{Res, ResMut, Resource},
+    prelude::{Res, ResMut, Resource, Handle, Image},
     render::{
         render_resource::{Buffer, ComputePipeline},
-        renderer::{RenderDevice, RenderQueue},
+        renderer::{RenderDevice, RenderQueue}, render_asset::RenderAssets,
     },
     utils::{HashMap, Uuid},
 };
 use bytemuck::{bytes_of, cast_slice, from_bytes, AnyBitPattern, NoUninit};
 use wgpu::{
     BindGroupDescriptor, BindGroupEntry, CommandEncoder, CommandEncoderDescriptor,
-    ComputePassDescriptor,
+    ComputePassDescriptor, BindingResource,
 };
 
 use crate::{
@@ -55,6 +55,12 @@ pub(crate) struct StagingBuffer {
     pub(crate) buffer: Buffer,
 }
 
+#[derive(Clone)]
+pub(crate) enum BufferType {
+    Buffer(Buffer),
+    Texture(Handle<Image>),
+}
+
 /// Struct to manage data transfers from/to the GPU
 /// it also handles the logic of your compute work.
 /// By default, the run mode of the workers is set to continuous,
@@ -67,7 +73,7 @@ pub struct AppComputeWorker<W: ComputeWorker> {
     render_queue: RenderQueue,
     cached_pipeline_ids: HashMap<Uuid, CachedAppComputePipelineId>,
     pipelines: HashMap<Uuid, Option<ComputePipeline>>,
-    buffers: HashMap<String, Buffer>,
+    buffers: HashMap<String, BufferType>,
     staging_buffers: HashMap<String, StagingBuffer>,
     steps: Vec<Step>,
     command_encoder: Option<CommandEncoder>,
@@ -108,7 +114,7 @@ impl<W: ComputeWorker> From<&AppComputeWorkerBuilder<'_, W>> for AppComputeWorke
 
 impl<W: ComputeWorker> AppComputeWorker<W> {
     #[inline]
-    fn dispatch(&mut self, index: usize) -> Result<()> {
+    fn dispatch(&mut self, index: usize, images: &Option<Res<RenderAssets<Image>>>) -> Result<()> {
         let compute_pass = match &self.steps[index] {
             Step::ComputePass(compute_pass) => compute_pass,
             Step::Swap(_, _) => return Err(Error::InvalidStep(format!("{:?}", self.steps[index]))),
@@ -123,7 +129,16 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
 
             let entry = BindGroupEntry {
                 binding: index as u32,
-                resource: buffer.as_entire_binding(),
+                resource: match (buffer, images) {
+                    (BufferType::Buffer(buffer), _) => buffer.as_entire_binding(),
+                    (BufferType::Texture(texture), Some(images)) => {
+                        let view = images.get(texture).unwrap();
+                        BindingResource::TextureView(&view.texture_view)
+                    },
+                    (BufferType::Texture(_), None) => {
+                        return Err(Error::NoImages()); 
+                    },
+                },
             };
 
             entries.push(entry);
@@ -192,13 +207,15 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
                 .get(name)
                 else { return Err(Error::BufferNotFound(name.to_owned()))};
 
-            encoder.copy_buffer_to_buffer(
-                &buffer,
-                0,
-                &staging_buffer.buffer,
-                0,
-                staging_buffer.buffer.size(),
-            );
+            if let BufferType::Buffer(buffer) = buffer {
+                encoder.copy_buffer_to_buffer(
+                    &buffer,
+                    0,
+                    &staging_buffer.buffer,
+                    0,
+                    staging_buffer.buffer.size(),
+                );
+            }
         }
         Ok(self)
     }
@@ -277,9 +294,12 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
             .get(target)
             else { return Err(Error::BufferNotFound(target.to_owned())) };
 
-        let bytes = bytes_of(data);
-
-        self.render_queue.write_buffer(buffer, 0, bytes);
+        if let BufferType::Buffer(buffer) = buffer {
+            let bytes = bytes_of(data);
+            self.render_queue.write_buffer(buffer, 0, bytes);
+        } else {
+            return Err(Error::BufferIsTexture(target.to_owned()));
+        }
 
         Ok(())
     }
@@ -299,9 +319,12 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
             .get(target)
             else { return Err(Error::BufferNotFound(target.to_owned())) };
 
-        let bytes = cast_slice(data);
-
-        self.render_queue.write_buffer(buffer, 0, bytes);
+        if let BufferType::Buffer(buffer) = buffer {
+            let bytes = cast_slice(data);
+            self.render_queue.write_buffer(buffer, 0, bytes);
+        } else {
+            return Err(Error::BufferIsTexture(target.to_owned()));
+        }
 
         Ok(())
     }
@@ -347,7 +370,7 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
         (self.state != WorkerState::Working) && (self.run_mode != RunMode::OneShot(false))
     }
 
-    pub(crate) fn run(mut worker: ResMut<Self>) {
+    pub(crate) fn run(mut worker: ResMut<Self>, images: Option<Res<RenderAssets<Image>>>) {
         if worker.ready() {
             worker.state = WorkerState::Available;
         }
@@ -356,7 +379,7 @@ impl<W: ComputeWorker> AppComputeWorker<W> {
             // Workaround for interior mutability
             for i in 0..worker.steps.len() {
                 let result = match worker.steps[i] {
-                    Step::ComputePass(_) => worker.dispatch(i),
+                    Step::ComputePass(_) => worker.dispatch(i, &images),
                     Step::Swap(_, _) => worker.swap(i),
                 };
 
